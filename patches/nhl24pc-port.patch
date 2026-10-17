@@ -1140,3 +1140,27 @@ index 07a2959..d6dfc8a 100644
      Common::LRUCache<Image> image_lru_cache;
      Common::LRUCache<Sampler> sampler_lru_cache;
      const bool readback_linear_images;
+diff --git a/src/shader_recompiler/frontend/inline_table.h b/src/shader_recompiler/frontend/inline_table.h
+new file mode 100644
+--- /dev/null
++++ b/src/shader_recompiler/frontend/inline_table.h
+@@ -0,0 +1,19 @@
++// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <unordered_map>
++#include <vector>
++#include "common/types.h"
++
++namespace Shader::Gcn {
++
++struct InlineTable {
++    u32 index_bias{};
++    std::vector<u64> values;
++};
++
++using InlineTables = std::unordered_map<u32, InlineTable>;
++
++} // namespace Shader::Gcn
