@@ -1,0 +1,1142 @@
+diff --git a/src/common/lru_cache.h b/src/common/lru_cache.h
+index c0fecba..9782009 100644
+--- a/src/common/lru_cache.h
++++ b/src/common/lru_cache.h
+@@ -60,7 +60,7 @@ public:
+     template <typename Func>
+     void ForEachItemBelow(TickType tick, Func&& func) {
+         static constexpr bool RETURNS_BOOL =
+-            std::is_same_v<std::invoke_result<Func, ObjectType>, bool>;
++            std::is_same_v<std::invoke_result_t<Func, ObjectType&>, bool>;
+         Node* it = first;
+         while (it) {
+             if (static_cast<s64>(tick) - static_cast<s64>(it->tick) < 0) {
+diff --git a/src/core/file_sys/ifile.h b/src/core/file_sys/ifile.h
+index cca25c2..a741e65 100644
+--- a/src/core/file_sys/ifile.h
++++ b/src/core/file_sys/ifile.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #pragma once
++#include <vector>
+ 
+ #include <filesystem>
+ #include <functional>
+diff --git a/src/core/libraries/pad/pad.cpp b/src/core/libraries/pad/pad.cpp
+index 02a19e8..f7f5613 100644
+--- a/src/core/libraries/pad/pad.cpp
++++ b/src/core/libraries/pad/pad.cpp
+@@ -375,6 +375,10 @@ int ProcessStates(OrbisPadData* pData, const Input::State* states, s32 num) {
+ 
+     const bool gamepad_input_intercepted = ImGui::Core::IsGamepadInputCaptured();
+     for (int i = 0; i < num; i++) {
++        if (u32(states[i].buttonsState) != 0) {
++            LOG_DEBUG(Lib_Pad, "Pad state buttons={:#x} connected={} intercepted={}",
++                      u32(states[i].buttonsState), states[i].connected, gamepad_input_intercepted);
++        }
+         pData[i] = {};
+         if (gamepad_input_intercepted) {
+             pData[i].buttons = OrbisPadButtonDataOffset::Intercepted;
+diff --git a/src/core/libraries/save_data/save_backup.cpp b/src/core/libraries/save_data/save_backup.cpp
+index 728acdb..68ec68f 100644
+--- a/src/core/libraries/save_data/save_backup.cpp
++++ b/src/core/libraries/save_data/save_backup.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <deque>
+ #include <mutex>
+ #include <ranges>
+@@ -290,4 +291,4 @@ void ClearProgress() {
+     g_backup_progress = 0;
+ }
+ 
+-} // namespace Libraries::SaveData::Backup
+\ No newline at end of file
++} // namespace Libraries::SaveData::Backup
+diff --git a/src/input/controller.cpp b/src/input/controller.cpp
+index c3a9c56..daa7071 100644
+--- a/src/input/controller.cpp
++++ b/src/input/controller.cpp
+@@ -97,6 +97,9 @@ int GameController::ReadStates(State* states, int states_num) {
+ void GameController::Button(OrbisPadButtonDataOffset button, bool is_pressed) {
+     std::lock_guard lock{m_state_mutex};
+     m_state.OnButton(button, is_pressed);
++    LOG_DEBUG(Input, "Controller {} button {:#x} pressed={} state={:#x} connected={}",
++              static_cast<void*>(this), u32(button), is_pressed, u32(m_state.buttonsState),
++              m_state.connected);
+     PushStateLocked();
+ }
+ 
+diff --git a/src/input/input_handler.cpp b/src/input/input_handler.cpp
+index 874a069..78bc336 100644
+--- a/src/input/input_handler.cpp
++++ b/src/input/input_handler.cpp
+@@ -458,8 +458,11 @@ void ParseInputConfig(const std::string game_id = "") {
+         } else if (output_string == "key_toggle") {
+             if (comma_pos != std::string::npos) {
+                 // handle key-to-key toggling (separate list?)
+-                InputBinding toggle_keys = GetBindingFromString(input_string);
+-                if (toggle_keys.KeyCount() != 2) {
++                auto toggler_name = input_string.substr(0, comma_pos);
++                auto target_name = input_string.substr(comma_pos + 1);
++                const auto toggler = GetBindingFromString(toggler_name);
++                const auto target = GetBindingFromString(target_name);
++                if (toggler.KeyCount() != 1 || target.KeyCount() != 1) {
+                     LOG_WARNING(Input,
+                                 "Syntax error: Please provide exactly 2 keys: "
+                                 "first is the toggler, the second is the key to toggle: {}",
+@@ -469,7 +472,7 @@ void ParseInputConfig(const std::string game_id = "") {
+                 ControllerOutput* toggle_out =
+                     &*std::ranges::find(output_arrays[0].data, ControllerOutput(KEY_TOGGLE));
+                 BindingConnection toggle_connection = BindingConnection(
+-                    InputBinding(toggle_keys.keys[0]), toggle_out, 0, toggle_keys.keys[1]);
++                    toggler, toggle_out, 0, target.keys[0]);
+                 connections.insert(connections.end(), toggle_connection);
+                 return;
+             }
+@@ -933,7 +936,7 @@ InputEvent BindingConnection::ProcessBinding() {
+     // and the analog inputs are always the last one due to how they are sorted,
+     // so this signifies whether or not the input is analog
+     InputEvent event = InputEvent(binding.keys[0]);
+-    if (pressed_keys.empty()) {
++    if (pressed_keys.empty() && toggled_keys.empty()) {
+         return event;
+     }
+     if (event.input.type != InputType::Axis) {
+diff --git a/src/shader_recompiler/frontend/control_flow_graph.cpp b/src/shader_recompiler/frontend/control_flow_graph.cpp
+index f38f077..07dfc7e 100644
+--- a/src/shader_recompiler/frontend/control_flow_graph.cpp
++++ b/src/shader_recompiler/frontend/control_flow_graph.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cstring>
+ #include "common/assert.h"
+ #include "common/logging/log.h"
+ #include "shader_recompiler/frontend/control_flow_graph.h"
+@@ -11,15 +12,15 @@ namespace Shader::Gcn {
+ 
+ struct Compare {
+     bool operator()(const Block& lhs, u32 rhs) const noexcept {
+-        return lhs.begin < rhs;
++        return lhs.SortKey() < (u64(rhs) << 32);
+     }
+ 
+     bool operator()(u32 lhs, const Block& rhs) const noexcept {
+-        return lhs < rhs.begin;
++        return (u64(lhs) << 32) < rhs.SortKey();
+     }
+ 
+     bool operator()(const Block& lhs, const Block& rhs) const noexcept {
+-        return lhs.begin < rhs.begin;
++        return lhs.SortKey() < rhs.SortKey();
+     }
+ };
+ 
+@@ -103,17 +104,164 @@ static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32
+ 
+ static constexpr size_t LabelReserveSize = 32;
+ 
+-CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_)
+-    : block_pool{block_pool_}, inst_list{inst_list_} {
++CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_,
++         std::span<const u32> program_memory_)
++    : program_memory{program_memory_}, block_pool{block_pool_}, inst_list{inst_list_} {
+     index_to_pc.resize(inst_list.size() + 1);
++    for (size_t i = 0; i < inst_list.size(); ++i) {
++        index_to_pc[i + 1] = index_to_pc[i] + inst_list[i].length;
++    }
+     labels.reserve(LabelReserveSize);
+     EmitLabels();
+     EmitBlocks();
+     LinkBlocks();
++    LinkJumpTables();
+     SplitDivergenceScopes();
+     RemoveUnreachableBlocks();
+ }
+ 
++static std::optional<u32> ScalarConstant(const InstOperand& operand) {
++    if (operand.field == OperandField::LiteralConst) {
++        return operand.code;
++    }
++    if ((operand.field == OperandField::ConstZero ||
++         operand.field == OperandField::SignedConstIntPos) &&
++        operand.code >= 128 && operand.code <= 192) {
++        return operand.code - 128;
++    }
++    return std::nullopt;
++}
++
++bool CFG::ResolveJumpTable(u32 index) {
++    if (index < 3 || program_memory.empty()) {
++        return false;
++    }
++    const auto scalar = [](const InstOperand& operand, u32 reg) {
++        return operand.field == OperandField::ScalarGPR && operand.code == reg;
++    };
++    const auto last_write = [&](u32 before, u32 reg) -> std::optional<u32> {
++        const u32 begin = before > 32 ? before - 32 : 0;
++        for (u32 pos = before; pos-- > begin;) {
++            const auto& inst = inst_list[pos];
++            if (inst.IsTerminateInstruction()) {
++                return std::nullopt;
++            }
++            for (u32 d = 0; d < inst.dst_count; ++d) {
++                if (scalar(inst.dst[d], reg)) {
++                    return pos;
++                }
++            }
++        }
++        return std::nullopt;
++    };
++    const auto& getpc = inst_list[index - 3];
++    const auto& add = inst_list[index - 2];
++    const auto& carry = inst_list[index - 1];
++    const auto& setpc = inst_list[index];
++    const u32 pc_reg = setpc.src[0].code;
++    if (getpc.opcode != Opcode::S_GETPC_B64 || !scalar(getpc.dst[0], pc_reg) ||
++        add.opcode != Opcode::S_ADD_U32 || !scalar(add.dst[0], pc_reg) ||
++        !scalar(add.src[0], pc_reg) || add.src[1].field != OperandField::ScalarGPR ||
++        carry.opcode != Opcode::S_ADDC_U32 || !scalar(carry.dst[0], pc_reg + 1) ||
++        !scalar(carry.src[0], pc_reg + 1) || !scalar(carry.src[1], add.src[1].code + 1)) {
++        return false;
++    }
++    const auto load_pos = last_write(index - 3, add.src[1].code);
++    if (!load_pos) {
++        return false;
++    }
++    const auto& load = inst_list[*load_pos];
++    const auto& smrd = load.control.smrd;
++    if (load.opcode != Opcode::S_LOAD_DWORDX2 || smrd.imm || smrd.offset >= 104) {
++        return false;
++    }
++    const u32 table_reg = load.src[0].code * 2;
++    const auto table_add_pos = last_write(*load_pos, table_reg);
++    if (!table_add_pos || *table_add_pos == 0) {
++        return false;
++    }
++    const auto& table_getpc = inst_list[*table_add_pos - 1];
++    const auto& table_add = inst_list[*table_add_pos];
++    if (*table_add_pos + 1 >= *load_pos) {
++        return false;
++    }
++    const auto& table_carry = inst_list[*table_add_pos + 1];
++    if (table_getpc.opcode != Opcode::S_GETPC_B64 || !scalar(table_getpc.dst[0], table_reg) ||
++        table_add.opcode != Opcode::S_ADD_U32 || table_carry.opcode != Opcode::S_ADDC_U32 ||
++        !scalar(table_carry.dst[0], table_reg + 1) ||
++        !((scalar(table_carry.src[0], table_reg + 1) && ScalarConstant(table_carry.src[1]) == 0) ||
++          (scalar(table_carry.src[1], table_reg + 1) && ScalarConstant(table_carry.src[0]) == 0))) {
++        return false;
++    }
++    const auto constant = scalar(table_add.src[0], table_reg)   ? ScalarConstant(table_add.src[1])
++                          : scalar(table_add.src[1], table_reg) ? ScalarConstant(table_add.src[0])
++                                                                : std::nullopt;
++    const auto index_pos = last_write(*load_pos, smrd.offset);
++    auto shift_pos = index_pos;
++    u32 index_bias = 0;
++    if (index_pos && inst_list[*index_pos].opcode == Opcode::S_ADD_U32) {
++        const auto& bias_add = inst_list[*index_pos];
++        const auto bias = scalar(bias_add.src[0], smrd.offset)
++                              ? ScalarConstant(bias_add.src[1])
++                          : scalar(bias_add.src[1], smrd.offset)
++                              ? ScalarConstant(bias_add.src[0])
++                              : std::nullopt;
++        if (!bias) {
++            return false;
++        }
++        index_bias = *bias;
++        shift_pos = last_write(*index_pos, smrd.offset);
++    }
++    if (!constant || !shift_pos || *shift_pos == 0) {
++        return false;
++    }
++    const auto& shift = inst_list[*shift_pos];
++    const auto& clamp = inst_list[*shift_pos - 1];
++    if (shift.opcode != Opcode::S_LSHL_B32 || !scalar(shift.src[0], smrd.offset) ||
++        ScalarConstant(shift.src[1]) != 3 || clamp.opcode != Opcode::S_MIN_U32 ||
++        !scalar(clamp.dst[0], smrd.offset) || last_write(index - 3, smrd.offset) != index_pos) {
++        return false;
++    }
++    const auto maximum = ScalarConstant(clamp.src[1]);
++    if (!maximum || *maximum > 255 || u64(index_bias) + u64(*maximum) * sizeof(s64) > UINT32_MAX) {
++        return false;
++    }
++    const u64 table_pc =
++        u64(index_to_pc[*table_add_pos - 1]) + table_getpc.length + *constant + index_bias;
++    const u64 table_size = (u64(*maximum) + 1) * sizeof(s64);
++    if (table_pc % alignof(u32) != 0 || table_pc + table_size > program_memory.size_bytes()) {
++        return false;
++    }
++    JumpTable table{smrd.offset, index_bias, {}};
++    std::vector<u64> table_values;
++    const u32 branch_base = index_to_pc[index - 3] + getpc.length;
++    for (u32 entry = 0; entry <= *maximum; ++entry) {
++        s64 offset;
++        std::memcpy(&offset,
++                    reinterpret_cast<const u8*>(program_memory.data()) + table_pc +
++                        entry * sizeof(offset),
++                    sizeof(offset));
++        if (offset < -s64(branch_base) || offset >= s64(index_to_pc.back()) - branch_base) {
++            return false;
++        }
++        const s64 target = s64(branch_base) + offset;
++        if ((target & 3) != 0 ||
++            !std::ranges::binary_search(index_to_pc, u32(target))) {
++            return false;
++        }
++        table.targets.push_back(u32(target));
++        table_values.push_back(u64(offset));
++    }
++    for (const auto target : table.targets) {
++        AddLabel(target);
++    }
++    LOG_INFO(Render_Recompiler, "Resolved indirect jump at {:#x}: {} entries at {:#x}",
++             index_to_pc[index], table.targets.size(), table_pc);
++    jump_tables.emplace(index, std::move(table));
++    inline_tables.emplace(index_to_pc[*load_pos], InlineTable{index_bias, std::move(table_values)});
++    return true;
++}
++
+ void CFG::EmitLabels() {
+     // Always set a label at entry point.
+     u32 pc = 0;
+@@ -128,7 +276,7 @@ void CFG::EmitLabels() {
+             if (inst.opcode == Opcode::S_SETPC_B64) {
+                 if (auto t = ResolveSetPcTarget(inst_list, i, index_to_pc)) {
+                     target = *t;
+-                } else {
++                } else if (!ResolveJumpTable(i)) {
+                     ASSERT_MSG(
+                         false,
+                         "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+@@ -136,7 +284,9 @@ void CFG::EmitLabels() {
+                         pc, i);
+                 }
+             }
+-            AddLabel(target);
++            if (!jump_tables.contains(i)) {
++                AddLabel(target);
++            }
+             // Emit this label so that the block ends with the branching instruction
+             AddLabel(pc + inst.length);
+         } else if (inst.IsConditionalBranch()) {
+@@ -185,6 +335,9 @@ void CFG::SplitDivergenceScopes() {
+ 
+     for (auto blk = blocks.begin(); blk != blocks.end(); blk++) {
+         auto next_blk = std::next(blk);
++        if (blk->dispatch_register) {
++            continue;
++        }
+         s32 curr_begin = -1;
+         for (size_t index = blk->begin_index; index <= blk->end_index; index++) {
+             const auto& inst = inst_list[index];
+@@ -334,6 +487,9 @@ void CFG::LinkBlocks() {
+         const u32 branch_pc = block.end - end_inst.length;
+         u32 target_pc = 0;
+         if (end_inst.opcode == Opcode::S_SETPC_B64) {
++            if (jump_tables.contains(block.end_index)) {
++                continue;
++            }
+             auto tgt = ResolveSetPcTarget(inst_list, block.end_index, index_to_pc);
+             ASSERT_MSG(tgt,
+                        "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
+@@ -370,6 +526,51 @@ void CFG::LinkBlocks() {
+     }
+ }
+ 
++void CFG::LinkJumpTables() {
++    for (const auto& [index, table] : jump_tables) {
++        auto origin = std::ranges::find_if(
++            blocks, [&](const auto& block) { return block.end_index == index; });
++        ASSERT(origin != blocks.end());
++        Block* previous = &*origin;
++        previous->end_class = EndClass::Branch;
++        u32 last_entry = u32(table.targets.size() - 1);
++        while (last_entry > 0 && table.targets[last_entry - 1] == table.targets.back()) {
++            --last_entry;
++        }
++        for (u32 entry = 0; entry <= last_entry; ++entry) {
++            auto target = blocks.find(table.targets[entry], Compare{});
++            ASSERT(target != blocks.end());
++            if (entry == last_entry) {
++                if (previous == &*origin) {
++                    previous->branch_true = &*target;
++                } else {
++                    previous->branch_false = &*target;
++                }
++                target->num_predecessors++;
++                break;
++            }
++            Block* dispatch = block_pool.Create();
++            dispatch->begin = origin->end - 1;
++            dispatch->end = origin->end;
++            dispatch->dispatch_order = entry + 1;
++            dispatch->dispatch_register = table.index_register;
++            dispatch->dispatch_value = table.index_bias + entry * sizeof(s64);
++            dispatch->end_class = EndClass::Branch;
++            dispatch->cond = IR::Condition::Scc1;
++            dispatch->branch_true = &*target;
++            dispatch->num_predecessors = 1;
++            target->num_predecessors++;
++            blocks.insert(*dispatch);
++            if (previous == &*origin) {
++                previous->branch_true = dispatch;
++            } else {
++                previous->branch_false = dispatch;
++            }
++            previous = dispatch;
++        }
++    }
++}
++
+ void CFG::RemoveUnreachableBlocks() {
+     for (auto it = std::next(blocks.begin()); it != blocks.end();) {
+         if (it->num_predecessors == 0) {
+@@ -384,7 +585,9 @@ void CFG::RemoveUnreachableBlocks() {
+ std::string CFG::Dot() const {
+     int node_uid{0};
+ 
+-    const auto name_of = [](const Block& block) { return fmt::format("\"{:#x}\"", block.begin); };
++    const auto name_of = [](const Block& block) {
++        return fmt::format("\"{:#x}:{}\"", block.begin, block.dispatch_order);
++    };
+ 
+     std::string dot{"digraph shader {\n"};
+     dot += fmt::format("\tsubgraph cluster_{} {{\n", 0);
+diff --git a/src/shader_recompiler/frontend/control_flow_graph.h b/src/shader_recompiler/frontend/control_flow_graph.h
+index f7b44eb..56f8109 100644
+--- a/src/shader_recompiler/frontend/control_flow_graph.h
++++ b/src/shader_recompiler/frontend/control_flow_graph.h
+@@ -4,14 +4,17 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <optional>
+ #include <span>
+ #include <string>
++#include <unordered_map>
+ #include <boost/container/small_vector.hpp>
+ #include <boost/intrusive/set.hpp>
+ 
+ #include "common/assert.h"
+ #include "common/object_pool.h"
+ #include "common/types.h"
++#include "shader_recompiler/frontend/inline_table.h"
+ #include "shader_recompiler/frontend/instruction.h"
+ #include "shader_recompiler/ir/condition.h"
+ 
+@@ -34,7 +37,11 @@ struct Block : Hook {
+     [[nodiscard]] bool Contains(u32 pc) const noexcept;
+ 
+     bool operator<(const Block& rhs) const noexcept {
+-        return begin < rhs.begin;
++        return SortKey() < rhs.SortKey();
++    }
++
++    u64 SortKey() const noexcept {
++        return (u64(begin) << 32) | dispatch_order;
+     }
+ 
+     u32 begin;
+@@ -49,6 +56,9 @@ struct Block : Hook {
+     Block* branch_false{};
+     IR::Block* ir_block{};
+     bool is_dummy{};
++    std::optional<u32> dispatch_register;
++    u32 dispatch_value{};
++    u32 dispatch_order{};
+ };
+ 
+ class CFG {
+@@ -57,7 +67,8 @@ class CFG {
+     using iterator = BlockList::iterator;
+ 
+ public:
+-    explicit CFG(Common::ObjectPool<Block>& block_pool, std::span<const GcnInst> inst_list);
++    explicit CFG(Common::ObjectPool<Block>& block_pool, std::span<const GcnInst> inst_list,
++                 std::span<const u32> program_memory = {});
+ 
+     [[nodiscard]] iterator begin() {
+         return blocks.begin();
+@@ -74,6 +85,16 @@ private:
+     void LinkBlocks();
+     void SplitDivergenceScopes();
+     void RemoveUnreachableBlocks();
++    bool ResolveJumpTable(u32 index);
++    void LinkJumpTables();
++
++    struct JumpTable {
++        u32 index_register;
++        u32 index_bias;
++        std::vector<u32> targets;
++    };
++    std::span<const u32> program_memory;
++    std::unordered_map<u32, JumpTable> jump_tables;
+ 
+     void AddLabel(Label address) {
+         const auto it = std::ranges::find(labels, address);
+@@ -95,6 +116,7 @@ public:
+     Common::ObjectPool<Block>& block_pool;
+     std::span<const GcnInst> inst_list;
+     std::vector<u32> index_to_pc;
++    InlineTables inline_tables;
+     boost::container::small_vector<Label, 16> labels;
+     BlockList blocks;
+ };
+diff --git a/src/shader_recompiler/frontend/structured_control_flow.cpp b/src/shader_recompiler/frontend/structured_control_flow.cpp
+index 057be14..12e8b14 100644
+--- a/src/shader_recompiler/frontend/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/structured_control_flow.cpp
+@@ -628,6 +628,9 @@ private:
+                 // Labels can be ignored
+                 break;
+             case StatementType::Code: {
++                if (current_block && current_block != stmt.block->ir_block) {
++                    current_block->AddBranch(stmt.block->ir_block);
++                }
+                 current_block = stmt.block->ir_block;
+                 insert_point = current_block->end();
+                 for (auto& node : syntax_list) {
+diff --git a/src/shader_recompiler/frontend/translate/translate.cpp b/src/shader_recompiler/frontend/translate/translate.cpp
+index 55904bf..2a6bd38 100644
+--- a/src/shader_recompiler/frontend/translate/translate.cpp
++++ b/src/shader_recompiler/frontend/translate/translate.cpp
+@@ -1238,15 +1238,35 @@ void Translator::LogMissingOpcode(const GcnInst& inst) {
+ }
+ 
+ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
+-                           std::span<const GcnInst> inst_list) {
++                           std::span<const GcnInst> inst_list,
++                           const InlineTables& inline_tables) {
+     if (inst_list.empty()) {
+         return;
+     }
+     ir = IR::IREmitter{*block, block->begin()};
+     pc = start_pc;
+     for (const auto& inst : inst_list) {
++        const auto table = inline_tables.find(pc);
+         pc += inst.length;
+ 
++        if (table != inline_tables.end()) {
++            const auto& values = table->second.values;
++            ASSERT(inst.opcode == Opcode::S_LOAD_DWORDX2 && !values.empty());
++            const auto index = ir.ISub(ir.GetScalarReg(IR::ScalarReg(inst.control.smrd.offset)),
++                                      ir.Imm32(table->second.index_bias));
++            for (u32 part = 0; part < 2; ++part) {
++                IR::U32 value = ir.Imm32(u32(values.back() >> (part * 32)));
++                for (size_t entry = values.size() - 1; entry-- > 0;) {
++                    const auto match = ir.IEqual(index, ir.Imm32(u32(entry * sizeof(u64))));
++                    value = IR::U32(ir.Select(match,
++                                             ir.Imm32(u32(values[entry] >> (part * 32))),
++                                             value));
++                }
++                ir.SetScalarReg(IR::ScalarReg(inst.dst[0].code + part), value);
++            }
++            continue;
++        }
++
+         // Special case for emitting fetch shader.
+         if (inst.opcode == Opcode::S_SWAPPC_B64) {
+             ASSERT(info.hw_stage == HwStage::Vertex || info.hw_stage == HwStage::Export ||
+diff --git a/src/shader_recompiler/frontend/translate/translate.h b/src/shader_recompiler/frontend/translate/translate.h
+index 9007abc..a3057bd 100644
+--- a/src/shader_recompiler/frontend/translate/translate.h
++++ b/src/shader_recompiler/frontend/translate/translate.h
+@@ -7,6 +7,7 @@
+ #include <unordered_map>
+ #include "shader_recompiler/frontend/fetch_shader.h"
+ #include "shader_recompiler/frontend/instruction.h"
++#include "shader_recompiler/frontend/inline_table.h"
+ #include "shader_recompiler/info.h"
+ #include "shader_recompiler/ir/basic_block.h"
+ #include "shader_recompiler/ir/condition.h"
+@@ -66,7 +67,8 @@ public:
+     explicit Translator(Info& info, const RuntimeInfo& runtime_info, const Profile& profile);
+ 
+     void Translate(IR::Block* block, u32 pc, IR::Condition cond,
+-                   std::span<const GcnInst> inst_list);
++                   std::span<const GcnInst> inst_list,
++                   const InlineTables& inline_tables = {});
+     void TranslateInstruction(const GcnInst& inst);
+ 
+     // Instruction categories
+diff --git a/src/shader_recompiler/recompiler.cpp b/src/shader_recompiler/recompiler.cpp
+index a6d8549..2f6437b 100644
+--- a/src/shader_recompiler/recompiler.cpp
++++ b/src/shader_recompiler/recompiler.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include "common/logging/classes.h"
++#include "core/memory.h"
+ #include "shader_recompiler/frontend/control_flow_graph.h"
+ #include "shader_recompiler/frontend/decode.h"
+ #include "shader_recompiler/frontend/structured_control_flow.h"
+@@ -40,8 +41,16 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
+         auto* ir_block = pools.block_pool.Create(pools.inst_pool);
+         ir_block->cfg_block = &block;
+         block.ir_block = ir_block;
++        if (block.dispatch_register) {
++            IR::IREmitter ir{*ir_block, ir_block->begin()};
++            ir_block->branch_cond =
++                ir.ConditionRef(ir.IEqual(ir.GetScalarReg(IR::ScalarReg(*block.dispatch_register)),
++                                          ir.Imm32(block.dispatch_value)));
++            program.blocks.push_back(ir_block);
++            continue;
++        }
+         translator.Translate(ir_block, block.begin, block.cond,
+-                             std::span{program.ins_list}.subspan(start, size));
++                             std::span{program.ins_list}.subspan(start, size), cfg.inline_tables);
+         program.blocks.push_back(ir_block);
+     }
+     translator.EmitPrologue(program.blocks.front());
+@@ -83,7 +92,18 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
+ 
+     // Create control flow graph
+     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
+-    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
++    std::span<const u32> program_memory = code;
++    void* mapped_end{};
++    u32 protection{};
++    auto* memory = Common::Singleton<Core::MemoryManager>::Instance();
++    if (memory->QueryProtection(info.pgm_base, nullptr, &mapped_end, &protection) == 0 &&
++        (protection & u32(Core::MemoryProt::CpuRead)) != 0 &&
++        reinterpret_cast<VAddr>(mapped_end) > info.pgm_base) {
++        const auto size =
++            std::min<VAddr>(reinterpret_cast<VAddr>(mapped_end) - info.pgm_base, 1024 * 1024);
++        program_memory = {code.data(), size / sizeof(u32)};
++    }
++    Gcn::CFG cfg{gcn_block_pool, program.ins_list, program_memory};
+     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
+ 
+     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate
+diff --git a/src/video_core/buffer_cache/buffer.cpp b/src/video_core/buffer_cache/buffer.cpp
+index 9924556..859ada3 100644
+--- a/src/video_core/buffer_cache/buffer.cpp
++++ b/src/video_core/buffer_cache/buffer.cpp
+@@ -1,10 +1,12 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <cstdlib>
+ #include <numeric>
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/logging/log.h"
+ #include "video_core/buffer_cache/buffer.h"
+ #include "video_core/renderer_vulkan/vk_instance.h"
+ #include "video_core/renderer_vulkan/vk_platform.h"
+@@ -14,6 +16,21 @@
+ 
+ namespace VideoCore {
+ 
++StreamMemoryPlacement GetUploadMemoryPlacement() {
++    const char* value = std::getenv("NHLPORT_UPLOAD_MEMORY");
++    if (!value || std::string_view{value} == "device") {
++        return StreamMemoryPlacement::Device;
++    }
++    if (std::string_view{value} == "host") {
++        return StreamMemoryPlacement::Host;
++    }
++    if (std::string_view{value} == "cached") {
++        return StreamMemoryPlacement::Cached;
++    }
++    LOG_WARNING(Render, "Invalid upload memory placement '{}'; using device", value);
++    return StreamMemoryPlacement::Device;
++}
++
+ std::string_view BufferTypeName(MemoryType type) {
+     switch (type) {
+     case MemoryType::HostUncached:
+@@ -31,12 +48,20 @@ std::string_view BufferTypeName(MemoryType type) {
+     }
+ }
+ 
+-[[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
++[[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type,
++                                                                 StreamMemoryPlacement placement) {
++    if (type == MemoryType::Stream && placement == StreamMemoryPlacement::Cached) {
++        return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++    }
+     return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                            : VkMemoryPropertyFlagBits{};
+ }
+ 
+-[[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
++[[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type,
++                                                           StreamMemoryPlacement placement) {
++    if (type == MemoryType::Stream && placement == StreamMemoryPlacement::Cached) {
++        return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
++    }
+     switch (type) {
+     case MemoryType::HostUncached:
+     case MemoryType::Stream:
+@@ -50,7 +75,10 @@ std::string_view BufferTypeName(MemoryType type) {
+     }
+ }
+ 
+-[[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type) {
++[[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type, StreamMemoryPlacement placement) {
++    if (type == MemoryType::Stream && placement != StreamMemoryPlacement::Device) {
++        return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
++    }
+     switch (type) {
+     case MemoryType::DeviceLocal:
+     case MemoryType::Stream:
+@@ -82,17 +110,17 @@ void UniqueBuffer::Destroy() {
+ }
+ 
+ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+-                          VmaAllocationInfo* out_alloc_info) {
++                          VmaAllocationInfo* out_alloc_info, StreamMemoryPlacement placement) {
+     const bool with_bda = bool(buffer_ci.usage & vk::BufferUsageFlagBits::eShaderDeviceAddress);
+     if (mem_type != MemoryType::Sparse) {
+         const VmaAllocationCreateFlags bda_flag =
+             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+-        const VmaAllocationCreateInfo alloc_ci = {
+-            .flags =
+-                VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
+-            .usage = MemoryUsageVma(mem_type),
++        VmaAllocationCreateInfo alloc_ci = {
++            .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
++                     MemoryUsageVmaFlags(mem_type, placement),
++            .usage = MemoryUsageVma(mem_type, placement),
+             .requiredFlags = 0,
+-            .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
++            .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type, placement),
+             .pool = VK_NULL_HANDLE,
+             .pUserData = nullptr,
+         };
+@@ -101,6 +129,18 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+         VkBuffer unsafe_buffer{};
+         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                           &allocation, out_alloc_info);
++        if (result != VK_SUCCESS && mem_type == MemoryType::Stream &&
++            placement != StreamMemoryPlacement::Device) {
++            LOG_WARNING(Render, "Upload placement allocation failed: {}; retrying device policy",
++                        vk::to_string(vk::Result{result}));
++            alloc_ci.flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag |
++                             MemoryUsageVmaFlags(mem_type, StreamMemoryPlacement::Device);
++            alloc_ci.usage = MemoryUsageVma(mem_type, StreamMemoryPlacement::Device);
++            alloc_ci.preferredFlags =
++                MemoryUsagePreferredVmaFlags(mem_type, StreamMemoryPlacement::Device);
++            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
++                                     &allocation, out_alloc_info);
++        }
+         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+                    vk::to_string(vk::Result{result}));
+         buffer = vk::Buffer{unsafe_buffer};
+@@ -121,7 +161,7 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+ }
+ 
+ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+-               MemoryType mem_type_, std::string_view debug_name)
++               MemoryType mem_type_, std::string_view debug_name, StreamMemoryPlacement placement)
+     : cpu_addr{cpu_addr_}, size_bytes{size_bytes_}, mem_type{mem_type_},
+       buffer{instance.GetDevice(), instance.GetAllocator()} {
+ 
+@@ -131,7 +171,7 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
+         .sharingMode = vk::SharingMode::eExclusive,
+     };
+     VmaAllocationInfo alloc_info{};
+-    buffer.Create(buffer_ci, mem_type, &alloc_info);
++    buffer.Create(buffer_ci, mem_type, &alloc_info, placement);
+ 
+     const auto device = instance.GetDevice();
+     if (!debug_name.empty()) {
+@@ -148,6 +188,14 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
+             mapped_data = std::span<u8>{std::bit_cast<u8*>(alloc_info.pMappedData), size_bytes};
+         }
+         is_coherent = property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++        if (mem_type == MemoryType::Stream) {
++            LOG_INFO(Render,
++                     "Stream allocation: name '{}' bytes {} requested placement {} "
++                     "memory type {} flags {:#x}; local {} cached {} coherent {}",
++                     debug_name, size_bytes, static_cast<u32>(placement), alloc_info.memoryType,
++                     property_flags, bool(property_flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
++                     bool(property_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT), is_coherent);
++        }
+     }
+ }
+ 
+@@ -169,8 +217,8 @@ constexpr u64 WATCHES_INITIAL_RESERVE = 0x100;
+ constexpr u64 WATCHES_RESERVE_CHUNK = 0x100;
+ 
+ StreamBuffer::StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
+-                           MemoryType mem_type, u64 size_bytes)
+-    : Buffer{instance, 0, size_bytes, mem_type}, scheduler{scheduler_},
++                           MemoryType mem_type, u64 size_bytes, StreamMemoryPlacement placement)
++    : Buffer{instance, 0, size_bytes, mem_type, "", placement}, scheduler{scheduler_},
+       non_coherent_atom_size{instance.NonCoherentAtomSize()} {
+     ReserveWatches(current_watches, WATCHES_INITIAL_RESERVE);
+     ReserveWatches(previous_watches, WATCHES_INITIAL_RESERVE);
+diff --git a/src/video_core/buffer_cache/buffer.h b/src/video_core/buffer_cache/buffer.h
+index 2b0a821..3492084 100644
+--- a/src/video_core/buffer_cache/buffer.h
++++ b/src/video_core/buffer_cache/buffer.h
+@@ -35,6 +35,14 @@ enum class MemoryType : u8 {
+     Sparse,       ///< Requires an unbacked sparse resident buffer.
+ };
+ 
++enum class StreamMemoryPlacement : u8 {
++    Device,
++    Host,
++    Cached,
++};
++
++StreamMemoryPlacement GetUploadMemoryPlacement();
++
+ constexpr vk::BufferUsageFlags ReadFlags =
+     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
+     vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eVertexBuffer |
+@@ -69,7 +77,8 @@ struct UniqueBuffer {
+     }
+ 
+     void Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
+-                VmaAllocationInfo* out_alloc_info);
++                VmaAllocationInfo* out_alloc_info,
++                StreamMemoryPlacement placement = StreamMemoryPlacement::Device);
+ 
+     void Destroy();
+ 
+@@ -82,7 +91,8 @@ struct UniqueBuffer {
+ 
+ struct Buffer {
+     explicit Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes_,
+-                    MemoryType mem_type, std::string_view debug_name = "");
++                    MemoryType mem_type, std::string_view debug_name = "",
++                    StreamMemoryPlacement placement = StreamMemoryPlacement::Device);
+ 
+     Buffer& operator=(const Buffer&) = delete;
+     Buffer(const Buffer&) = delete;
+@@ -131,7 +141,8 @@ struct Buffer {
+ 
+ struct StreamBuffer : public Buffer {
+     explicit StreamBuffer(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
+-                          MemoryType mem_type, u64 size_bytes);
++                          MemoryType mem_type, u64 size_bytes,
++                          StreamMemoryPlacement placement = StreamMemoryPlacement::Device);
+ 
+     /// Reserves a region of memory from the stream buffer. Must be followed by Commit().
+     std::pair<u8*, u64> Map(u64 size, u64 alignment = 0, bool allow_wait = true);
+diff --git a/src/video_core/buffer_cache/buffer_cache.cpp b/src/video_core/buffer_cache/buffer_cache.cpp
+index a808248..02ae74a 100644
+--- a/src/video_core/buffer_cache/buffer_cache.cpp
++++ b/src/video_core/buffer_cache/buffer_cache.cpp
+@@ -57,7 +57,8 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
+       staging_pool{runtime_.GetStagingPool()}, liverpool{liverpool_},
+       memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
+       memory_tracker{std::make_unique<MemoryTracker>(tracker)},
+-      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE},
++      stream_buffer{instance, scheduler, MemoryType::Stream, STREAM_BUFFER_SIZE,
++                    GetUploadMemoryPlacement()},
+       gds_buffer{instance, 0, GDS_BUFFER_SIZE, MemoryType::Stream, "GDS Buffer"},
+       transfer_semaphore{instance}, memory_semaphore{instance} {
+     // nhlport: readback copies on a second queue (NHLPORT_READBACK_DRAIN=1 restores Finish()).
+@@ -504,21 +505,13 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+         return;
+     }
+ 
+-    const vk::MemoryAllocateFlagsInfo alloc_flags = {
+-        .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
+-    };
+-    const vk::MemoryAllocateInfo alloc_info = {
+-        .pNext = &alloc_flags,
+-        .allocationSize = resident_blocks << block_shift,
+-        .memoryTypeIndex = arena_memory_type_index,
+-    };
+-    const auto device_memory = Vulkan::Check(instance.GetDevice().allocateMemory(alloc_info));
++    const auto [device_memory, base_offset] = AllocateResidency(u64(resident_blocks) << block_shift);
+ 
+     boost::container::small_vector<vk::BufferCopy, 8> copies;
+     const auto staging =
+         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
+ 
+-    u64 memory_offset{};
++    u64 memory_offset = base_offset;
+     ArenaBinds* binds = BindsForArena(arena);
+     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
+     u64 offset = staging.offset;
+@@ -552,6 +545,46 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
+     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+ }
+ 
++std::pair<vk::DeviceMemory, u64> BufferCache::AllocateResidency(u64 bytes) {
++    constexpr u64 chunk_size = 64_MB;
++    const auto allocate = [&](u64 size) {
++        const vk::MemoryAllocateFlagsInfo flags = {
++            .flags = vk::MemoryAllocateFlagBits::eDeviceAddress,
++        };
++        const vk::MemoryAllocateInfo info = {
++            .pNext = &flags,
++            .allocationSize = size,
++            .memoryTypeIndex = arena_memory_type_index,
++        };
++        const auto allocation = instance.GetDevice().allocateMemory(info);
++        if (allocation.result != vk::Result::eSuccess) {
++            const auto [used, budget] = instance.QueryMemoryUsage();
++            LOG_ERROR(Render, "Sparse residency allocation failed: {} MiB requested, {} chunks, "
++                              "device memory {} of {} MiB: {}",
++                      size >> 20, residency_allocations, used >> 20, budget >> 20,
++                      vk::to_string(allocation.result));
++        }
++        const auto memory = Vulkan::Check(allocation);
++        ++residency_allocations;
++        if (residency_allocations <= 4 || residency_allocations % 16 == 0) {
++            LOG_INFO(Render, "Sparse residency: {} device allocations, last {} MiB",
++                     residency_allocations, size >> 20);
++        }
++        return memory;
++    };
++    if (bytes > chunk_size) {
++        return {allocate(bytes), 0};
++    }
++    if (residency_used + bytes > residency_size) {
++        residency_memory = allocate(chunk_size);
++        residency_size = chunk_size;
++        residency_used = 0;
++    }
++    const u64 offset = residency_used;
++    residency_used += bytes;
++    return {residency_memory, offset};
++}
++
+ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
+                                     bool is_written, bool is_texel_buffer) {
+     boost::container::small_vector<vk::BufferCopy, 4> copies;
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index d641230..89910ab 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -124,6 +124,8 @@ private:
+ 
+     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+ 
++    std::pair<vk::DeviceMemory, u64> AllocateResidency(u64 bytes);
++
+     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+ 
+     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
+@@ -175,6 +177,10 @@ private:
+     IntervalList<Backing> resident_ranges;
+ 
+     u32 arena_memory_type_index{};
++    vk::DeviceMemory residency_memory;
++    u64 residency_size{};
++    u64 residency_used{};
++    u64 residency_allocations{};
+     u32 block_size{};
+     u32 block_shift{};
+     u32 blocks_per_arena_page{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 79209b5..aeb04ea 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -787,7 +787,7 @@ std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,
+ 
+ void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage,
+                                size_t perm_idx, std::string_view ext) {
+-    if (!EmulatorSettings.IsDumpShaders()) {
++    if (!EmulatorSettings.IsDumpShaders() && !(Diag::Enabled() && ext == "bin")) {
+         return;
+     }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+index 7485d73..08108e1 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+@@ -12,7 +12,7 @@
+ 
+ namespace Serialization {
+ /* You should increment versions below once corresponding serialization scheme is changed. */
+-static constexpr u32 ShaderBinaryVersion = 7u;
++static constexpr u32 ShaderBinaryVersion = 9u;
+ static constexpr u32 ShaderMetaVersion = 6u;
+ static constexpr u32 PipelineKeyVersion = 3u;
+ } // namespace Serialization
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.cpp b/src/video_core/renderer_vulkan/vk_presenter.cpp
+index 7f5d3fc..b9eb16e 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.cpp
++++ b/src/video_core/renderer_vulkan/vk_presenter.cpp
+@@ -1089,6 +1089,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
+     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+     info.AddSignal(swapchain.GetPresentReadySemaphore());
+     info.AddSignal(frame->present_done);
++    frame->present_tick = scheduler.CurrentTick();
+     scheduler.Flush(info);
+ 
+     // Present to swapchain.
+@@ -1133,6 +1134,22 @@ Frame* Presenter::GetRenderFrame() {
+             fence_waited_s += 2;
+             LOG_WARNING(Render_Vulkan, "GetRenderFrame: waited {}s for the present fence (thread {})",
+                         fence_waited_s, Common::GetCurrentThreadName());
++            if (fence_waited_s == 2 || fence_waited_s % 10 == 0) {
++                const auto read_tick = [&](Scheduler& scheduler, std::string_view name) {
++                    const auto semaphore = scheduler.GetWorkSemaphore()->Handle();
++                    const auto counter = device.getSemaphoreCounterValue(semaphore);
++                    LOG_WARNING(Render_Vulkan, "Frame {} pending: scheduler {} completed tick {} query {}",
++                                frame->id, name, counter.value,
++                                vk::to_string(counter.result));
++                };
++                read_tick(draw_scheduler, "draw");
++                read_tick(present_scheduler, "present");
++                read_tick(flip_scheduler, "flip");
++                LOG_WARNING(Render_Vulkan, "Frame {} ready tick {} on {} scheduler; present tick {}",
++                            frame->id, frame->ready_tick,
++                            frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()
++                                ? "draw" : "flip", frame->present_tick);
++            }
+         }
+         return result;
+     };
+diff --git a/src/video_core/renderer_vulkan/vk_presenter.h b/src/video_core/renderer_vulkan/vk_presenter.h
+index 12e3382..a46e547 100644
+--- a/src/video_core/renderer_vulkan/vk_presenter.h
++++ b/src/video_core/renderer_vulkan/vk_presenter.h
+@@ -34,6 +34,7 @@ struct Frame {
+     vk::Fence present_done;
+     vk::Semaphore ready_semaphore;
+     u64 ready_tick;
++    u64 present_tick{};
+     bool is_hdr{false};
+     u8 id{};
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.cpp b/src/video_core/texture_cache/texture_cache.cpp
+index f1b2b68..16d3cc3 100644
+--- a/src/video_core/texture_cache/texture_cache.cpp
++++ b/src/video_core/texture_cache/texture_cache.cpp
+@@ -1245,7 +1245,19 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
+ 
+ void TextureCache::GarbageCollectImages() {
+     if (instance.CanReportMemoryUsage()) {
+-        total_used_memory = instance.GetDeviceMemoryUsage();
++        const auto [used, budget] = instance.QueryMemoryUsage();
++        total_used_memory = used;
++        if (budget != 0) {
++            trigger_gc_memory = budget * 70 / 100;
++            pressure_gc_memory = budget * 85 / 100;
++            critical_gc_memory = budget * 95 / 100;
++        }
++    }
++    const auto now = std::chrono::steady_clock::now();
++    const u64 second = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
++    if (second != gc_second) {
++        gc_second = second;
++        gc_tick_at_second[second % gc_tick_at_second.size()] = gc_tick;
+     }
+     if (total_used_memory < trigger_gc_memory) {
+         return;
+@@ -1253,35 +1265,44 @@ void TextureCache::GarbageCollectImages() {
+     bool pressured = false;
+     bool aggresive = false;
+     u64 ticks_to_destroy = 0;
++    u64 below_tick = 0;
+     size_t num_deletions = 0;
++    u32 visited = 0;
+ 
+-    const auto configure = [&](bool allow_aggressive) {
++    const auto configure = [&](bool allow_aggressive, bool emergency = false) {
+         pressured = total_used_memory >= pressure_gc_memory;
+         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
+         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
++        below_tick = gc_tick - ticks_to_destroy;
++        if (!emergency) {
++            const u64 idle_seconds = aggresive ? 1 : pressured ? 5 : 20;
++            below_tick = std::min(below_tick,
++                                 gc_tick_at_second[(second - idle_seconds) % gc_tick_at_second.size()]);
++        }
+         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
++        visited = 0;
+     };
+     const auto clean_up = [&](Image& image) {
+-        if (num_deletions == 0) {
++        if (num_deletions == 0 || ++visited > 256) {
+             return true;
+         }
+-        --num_deletions;
+         const bool download = image.SafeToDownload();
+         const bool tiled = image.info.IsTiled();
+-        if (tiled && download) {
+-            // This is a workaround for now. We can't handle non-linear image downloads.
+-            return false;
+-        }
+-        if (download && !pressured) {
++        if ((tiled && download) || (download && !pressured)) {
++            image_lru_cache.Touch(image, gc_tick);
++            ++gc_kept;
+             return false;
+         }
++        --num_deletions;
+         const auto image_id = slot_images.GetSlotId(image);
+         if (download) {
+-            DownloadImageMemory(image_id);
++            DownloadImageMemory(image_id, true);
++            ++gc_downloads;
+         }
+         VideoCore::Perf::NoteFree(VideoCore::Perf::FreeGc);
+         FreeImage(image_id);
++        ++gc_evictions;
+         if (total_used_memory < critical_gc_memory) {
+             if (aggresive) {
+                 num_deletions >>= 2;
+@@ -1298,12 +1319,25 @@ void TextureCache::GarbageCollectImages() {
+ 
+     // Try to remove anything old enough and not high priority.
+     configure(false);
+-    image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
++    image_lru_cache.ForEachItemBelow(below_tick, clean_up);
+ 
+     if (total_used_memory >= critical_gc_memory) {
+         // If we are still over the critical limit, run an aggressive GC
+         configure(true);
+-        image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
++        image_lru_cache.ForEachItemBelow(below_tick, clean_up);
++    }
++    if (total_used_memory >= critical_gc_memory) {
++        configure(true, true);
++        image_lru_cache.ForEachItemBelow(below_tick, clean_up);
++    }
++    if (now - gc_report_time >= std::chrono::seconds(5) &&
++        (pressured || gc_evictions != 0 || gc_kept != 0)) {
++        LOG_INFO(Render, "Texture collector: used {} MiB, pressure {} MiB, critical {} MiB; "
++                         "{} evicted, {} written back, {} retained",
++                 total_used_memory >> 20, pressure_gc_memory >> 20, critical_gc_memory >> 20,
++                 gc_evictions, gc_downloads, gc_kept);
++        gc_report_time = now;
++        gc_evictions = gc_downloads = gc_kept = 0;
+     }
+ }
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 07a2959..d6dfc8a 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <array>
++#include <chrono>
+ #include <mutex>
+ #include <vector>
+ #include <absl/container/flat_hash_map.h>
+@@ -426,6 +428,12 @@ private:
+     u64 pressure_gc_samplers = 0;
+     u64 critical_gc_samplers = 0;
+     u64 gc_tick = 0;
++    u64 gc_second{};
++    std::array<u64, 64> gc_tick_at_second{};
++    u64 gc_evictions{};
++    u64 gc_downloads{};
++    u64 gc_kept{};
++    std::chrono::steady_clock::time_point gc_report_time{};
+     Common::LRUCache<Image> image_lru_cache;
+     Common::LRUCache<Sampler> sampler_lru_cache;
+     const bool readback_linear_images;
